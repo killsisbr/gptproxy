@@ -1,7 +1,7 @@
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
-import { askChatGPT, LOGIN_REQUIRED, Attachment } from '../services/chatgpt.ts';
-import { buildPrompt, buildToolPrompt } from '../utils/prompt.ts';
+import { askChatGPT, LOGIN_REQUIRED, Attachment, SessionConversationCollisionError } from '../services/chatgpt.ts';
+import { buildHydrationPrompt, buildPrompt, buildSessionToolPrompt, buildToolPrompt, toolSignature } from '../utils/prompt.ts';
 import { extractToolCalls, parseResponse, ParsedToolCall } from '../utils/tools.ts';
 
 const PROTOCOL_REINFORCE =
@@ -205,8 +205,19 @@ async function streamText(
 export async function chatCompletions(c: Context) {
   try {
     const body: any = await c.req.json();
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      return c.json({ error: { message: '"messages" must be a non-empty array' } }, 400);
+    }
     const isStream = body.stream ?? false;
     const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+    const sessionKey = c.req.header('x-dsh-session-id') || body.metadata?.dsh_session_id || body.metadata?.session_id;
+    const requestId = c.req.header('x-dsh-request-id') || body.metadata?.request_id;
+    const scenario = c.req.header('x-dsh-scenario') || body.metadata?.scenario;
+    const askOpts = {
+      ...sessionKey === undefined ? {} : { sessionKey },
+      ...requestId === undefined ? {} : { requestId },
+      ...scenario === undefined ? {} : { scenario },
+    };
     const { clean: messages, attachments } = await sanitizeMessages(body.messages);
     const completionId = completionsId();
     const model = body.model || 'chatgpt';
@@ -228,7 +239,7 @@ export async function chatCompletions(c: Context) {
       // No tools: prompt used for direct answer (streaming keeps caller-visible deltas).
       prompt = buildPrompt(messages);
       if (!isStream) {
-        const result = await askChatGPT(prompt, undefined, 300000, attachments);
+        const result = await askChatGPT(prompt, undefined, 300000, attachments, { ...askOpts });
         return c.json({
           id: completionId,
           object: 'chat.completion',
@@ -269,7 +280,7 @@ export async function chatCompletions(c: Context) {
             model,
             choices: [makeChoice({ content: delta })],
           });
-        }, 300000, attachments);
+        }, 300000, attachments, { ...askOpts });
 
         await writeEvent({
           id: completionId,
@@ -282,9 +293,11 @@ export async function chatCompletions(c: Context) {
       });
     }
 
-    prompt = buildToolPrompt(messages, body.tools);
+    const hydrationKey = hasTools ? toolSignature(body.tools) : undefined;
+    const hydrationPrompt = sessionKey && hasTools ? buildHydrationPrompt(messages, body.tools) : undefined;
+    prompt = sessionKey ? buildSessionToolPrompt(messages) : buildToolPrompt(messages, body.tools);
     for (let attempt = 0; attempt < 2; attempt++) {
-      const result = await askChatGPT(prompt, undefined, 300000, attachments);
+      const result = await askChatGPT(prompt, undefined, 300000, attachments, { ...askOpts, hydrationPrompt, hydrationKey });
       text = result.text ?? '';
       parsed = parseResponse(text);
       calls = parsed.calls.length ? parsed.calls : (extractToolCalls(text) ?? []);
@@ -351,11 +364,25 @@ export async function chatCompletions(c: Context) {
       } else {
         await streamText(sw, c, finalText, completionId, model);
       }
-      await sw.end();
+      // hono's StreamingApi exposes close(), not end(); stream() itself also
+      // calls close() in its finally block once this callback resolves, so no
+      // explicit call is required here at all.
     });
   } catch (err: any) {
     if (err === LOGIN_REQUIRED || err?.message?.includes('Login required')) {
       return c.json({ error: { message: 'Login required. Run "bun run login".' } }, 401);
+    }
+    if (err instanceof SessionConversationCollisionError) {
+      console.error('Error in chatCompletions:', err);
+      return c.json({
+        error: {
+          code: err.code,
+          message: err.message,
+          sessionKey: err.sessionKey,
+          conversationUrl: err.conversationUrl,
+          ownedBy: err.ownedBy,
+        },
+      }, 409);
     }
     console.error('Error in chatCompletions:', err);
     return c.json({ error: { message: err.message } }, 500);

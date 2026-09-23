@@ -3,7 +3,8 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { bearerAuth } from 'hono/bearer-auth';
 import { chatCompletions } from './routes/chat.ts';
-import { initPlaywright, closePlaywright, getLoginStatus, generateImage, getContext, LOGIN_REQUIRED, BrowserType } from './services/chatgpt.ts';
+import { initPlaywright, closePlaywright, getLoginStatus, generateImage, getContext, LOGIN_REQUIRED, BrowserType, listGptProxySessions, clearGptProxySession } from './services/chatgpt.ts';
+import { telemetryLogPath } from './services/telemetry.ts';
 import { networkInterfaces } from 'os';
 import { fileURLToPath } from 'url';
 
@@ -40,6 +41,15 @@ app.get('/health', async (c) => {
 app.get('/v1/health', async (c) => {
   const login = await getLoginStatus();
   return c.json({ status: login.loggedIn ? 'ok' : 'degraded', loggedIn: login.loggedIn, url: login.url ?? null });
+});
+
+app.get('/debug/sessions', (c) => c.json({ sessions: listGptProxySessions() }));
+
+app.get('/debug/telemetry-path', (c) => c.json({ path: telemetryLogPath() }));
+
+app.delete('/debug/sessions/:key', (c) => {
+  const removed = clearGptProxySession(c.req.param('key'));
+  return c.json({ removed });
 });
 
 app.get('/debug/conv', async (c) => {

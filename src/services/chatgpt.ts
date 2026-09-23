@@ -1,6 +1,8 @@
-﻿import { chromium, firefox, webkit, Browser, BrowserContext, Page, Locator } from 'playwright';
+import { chromium, firefox, webkit, Browser, BrowserContext, Page, Locator } from 'playwright';
 import path from 'path';
 import fs from 'fs';
+import { gptProxySessions, GptProxySession } from './sessions.ts';
+import { recordTurn } from './telemetry.ts';
 
 export type BrowserType = 'chromium' | 'firefox' | 'webkit' | 'chrome' | 'edge';
 
@@ -184,25 +186,67 @@ export async function restartBrowser() {
   await initPlaywright(launchOpts.headless, launchOpts.browserType);
 }
 
+/**
+ * Matches a settled ChatGPT conversation URL (`https://chatgpt.com/c/<id>`).
+ * ChatGPT briefly renders a CLIENT-SIDE placeholder URL of the form
+ * `/c/WEB:<uuid>` immediately after the first send, before the backend
+ * assigns and the frontend adopts the real conversation id; that placeholder
+ * never reappears as a real, addressable conversation and must never be
+ * captured as a session's bound `conversationUrl`.
+ */
+const REAL_CONVERSATION_URL = /\/c\/(?!WEB:)[^/?#]+/u;
+
+/**
+ * Navigate to the ChatGPT home/composer, ready for a brand-new conversation.
+ * Direct navigation to `/` is used instead of clicking a "New chat" control:
+ * observed real behavior is that the sidebar/topbar new-chat button can fail
+ * to register a click (covered by an overlay, mid-render, or simply not the
+ * element Playwright resolved) while leaving the page on the PRIOR
+ * conversation with no visible error — the exact failure mode that let two
+ * different sessions previously bind to the same `conversationUrl`. A direct
+ * `goto('/')` has no such failure mode: it either lands on `/` or throws.
+ * Does not itself wait for a `/c/<id>` URL: the real conversation id is only
+ * assigned after the first message is sent (see {@link waitForNewConversationUrl}).
+ */
 async function startNewChat() {
   if (!page) throw new Error('Playwright not initialized');
-  const btn = await findVisible(page, [
-    '[data-testid="create-new-chat-button"]',
-    '[data-testid="new-chat-button"]',
-    'a[href="/new"]',
-    'button:has-text("New chat")',
-  ], 4000);
-  if (btn) {
-    await btn.click().catch(() => {});
-    await sleep(800);
-  }
+  await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.locator('#prompt-textarea').first().waitFor({ state: 'visible', timeout: 15000 });
 }
+
+/**
+ * Deterministically wait for the page to settle on a real (non-placeholder)
+ * ChatGPT conversation URL after the first message of a brand-new
+ * conversation has been sent.
+ * @param p - the live Playwright page.
+ * @param timeoutMs - positive finite deadline for the real URL to appear.
+ * @returns the settled `/c/<id>` URL.
+ * @throws {Error} when no real conversation URL appears before the deadline;
+ *   the caller must not bind a session to any URL in that case.
+ */
+async function waitForNewConversationUrl(p: Page, timeoutMs: number): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const url = p.url();
+    if (REAL_CONVERSATION_URL.test(url)) return url;
+    await sleep(150);
+  }
+  throw new Error(`GPTProxy did not observe a real ChatGPT conversation URL within ${timeoutMs}ms (last seen: ${p.url()})`);
+}
+
+/**
+ * Every wait/click/fill below carries an explicit finite timeout so a
+ * blocked or intercepted composer (an overlay, a rate-limit banner, a
+ * payment prompt) surfaces as a bounded, catchable error instead of hanging
+ * the request indefinitely.
+ */
+const COMPOSER_INTERACTION_TIMEOUT_MS = 30000;
 
 async function sendPrompt(p: Page, text: string) {
   const composer = p.locator('#prompt-textarea').first();
-  await composer.waitFor({ state: 'visible', timeout: 30000 });
-  await composer.click();
-  await composer.fill(text);
+  await composer.waitFor({ state: 'visible', timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
+  await composer.click({ timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
+  await composer.fill(text, { timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
   await sleep(200);
 
   const btn = await findVisible(p, [
@@ -211,11 +255,11 @@ async function sendPrompt(p: Page, text: string) {
     'button[type="submit"]',
   ], 4000);
   if (btn) {
-    await btn.click().catch(async () => {
-      await composer.press('Enter');
+    await btn.click({ timeout: COMPOSER_INTERACTION_TIMEOUT_MS }).catch(async () => {
+      await composer.press('Enter', { timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
     });
   } else {
-    await composer.press('Enter');
+    await composer.press('Enter', { timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
   }
 }
 
@@ -236,7 +280,7 @@ async function attachFiles(p: Page, files: Attachment[]) {
     }
     const input = p.locator('input[type="file"]').first();
     await input.waitFor({ state: 'attached', timeout: 15000 });
-    await input.setInputFiles(paths);
+    await input.setInputFiles(paths, { timeout: 15000 });
     await sleep(1200);
   } finally {
     for (const fp of paths) fs.rmSync(fp, { force: true });
@@ -245,7 +289,7 @@ async function attachFiles(p: Page, files: Attachment[]) {
 
 async function readAssistantStream(
   p: Page,
-  onDelta: (delta: string) => Promise<void> | void,
+  onDelta: ((delta: string) => Promise<void> | void) | undefined,
   timeoutMs: number
 ): Promise<string> {
   const msg = p.locator('[data-message-author-role="assistant"]').last();
@@ -379,25 +423,129 @@ export function getContext(): BrowserContext | null {
   return context;
 }
 
+export interface AskChatGPTOptions {
+  sessionKey?: string;
+  hydrationPrompt?: string;
+  hydrationKey?: string;
+  requestId?: string;
+  scenario?: string;
+}
+
+/**
+ * Thrown when a session's first real conversation URL would collide with a
+ * URL already bound to a DIFFERENT live session key. Binding proceeds only
+ * when no other session currently owns that URL; the caller must not
+ * silently continue on this error, since doing so would let two Harness
+ * chats share one ChatGPT conversation and its accumulated context.
+ */
+export class SessionConversationCollisionError extends Error {
+  readonly code = 'SESSION_CONVERSATION_COLLISION';
+  constructor(readonly sessionKey: string, readonly conversationUrl: string, readonly ownedBy: string) {
+    super(`GPTProxy session "${sessionKey}" resolved to conversation ${conversationUrl}, already bound to session "${ownedBy}"`);
+  }
+}
+
+async function openSessionConversation(p: Page, session: GptProxySession | null): Promise<void> {
+  if (!session) {
+    await startNewChat();
+    return;
+  }
+  if (session.conversationUrl) {
+    await p.goto(session.conversationUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    return;
+  }
+  await startNewChat();
+}
+
+/**
+ * Bind a session's first real conversation URL, after the first message of a
+ * brand-new conversation was just sent. Deterministically waits past
+ * ChatGPT's transient `/c/WEB:<uuid>` placeholder for the real, stable
+ * `/c/<id>` URL, then rejects a collision with another live session before
+ * committing the bind.
+ * @param p - the live Playwright page, mid-generation on the new conversation.
+ * @param session - the session whose first-ever conversation URL this is.
+ * @param timeoutMs - deadline for the real URL to settle.
+ * @throws {SessionConversationCollisionError} if the resolved URL already belongs to another session.
+ * @throws {Error} if no real conversation URL settles before the deadline.
+ */
+async function bindNewConversationUrl(p: Page, session: GptProxySession, timeoutMs: number): Promise<void> {
+  const url = await waitForNewConversationUrl(p, timeoutMs);
+  const owner = gptProxySessions.ownerOf(url);
+  if (owner !== undefined && owner !== session.key) {
+    throw new SessionConversationCollisionError(session.key, url, owner);
+  }
+  gptProxySessions.markTurn(session, url);
+}
+
+async function hydrateSession(p: Page, session: GptProxySession, options: AskChatGPTOptions, timeoutMs: number): Promise<void> {
+  if (!options.hydrationPrompt || !options.hydrationKey) return;
+  if (session.hydrationKey === options.hydrationKey) return;
+  const isFirstMessage = session.conversationUrl === undefined;
+  await sendPrompt(p, options.hydrationPrompt);
+  if (isFirstMessage) await bindNewConversationUrl(p, session, timeoutMs);
+  await readAssistantStream(p, undefined, timeoutMs);
+  session.hydrationKey = options.hydrationKey;
+  gptProxySessions.markTurn(session, p.url());
+}
+
+export function listGptProxySessions() {
+  return gptProxySessions.list();
+}
+
+export function clearGptProxySession(key: string): boolean {
+  return gptProxySessions.clear(key);
+}
+
 export async function askChatGPT(
   prompt: string,
   onDelta?: (delta: string) => Promise<void> | void,
   timeoutMs = 300000,
-  attachments: Attachment[] = []
+  attachments: Attachment[] = [],
+  options: AskChatGPTOptions = {}
 ): Promise<{ text: string }> {
   if (!page) throw new Error('Playwright not initialized');
 
+  const requestId = options.requestId ?? (crypto as any).randomUUID();
+  const startedAt = Date.now();
+  const mark = (): number => Date.now();
   const release = await uiMutex.acquire();
   try {
+    const beforeLogin = mark();
     if (!(await ensureLoggedIn())) {
       throw LOGIN_REQUIRED;
     }
+    const loginCheckMs = mark() - beforeLogin;
 
-    await startNewChat();
+    const beforeNav = mark();
+    const session = options.sessionKey ? gptProxySessions.getOrCreate(options.sessionKey) : null;
+    await openSessionConversation(page, session);
+    const navigationMs = mark() - beforeNav;
+
+    let hydrationMs: number | undefined;
+    if (session) {
+      const beforeHydration = mark();
+      await hydrateSession(page, session, options, timeoutMs);
+      hydrationMs = mark() - beforeHydration;
+    }
     if (attachments.length) await attachFiles(page, attachments);
+
+    // A session with no bound conversationUrl yet is about to send the first
+    // real message of a brand-new ChatGPT conversation (hydration, if any,
+    // already bound it above). This send must resolve and bind the real
+    // conversation URL before any further turn on this session trusts it.
+    const isFirstMessageOfSession = session !== null && session.conversationUrl === undefined;
+
+    const beforeSend = mark();
     await sendPrompt(page, prompt);
+    const sendPromptMs = mark() - beforeSend;
+
+    if (isFirstMessageOfSession && session !== null) {
+      await bindNewConversationUrl(page, session, timeoutMs);
+    }
 
     let text = '';
+    const beforeUiRoundTrip = mark();
     try {
       text = await readAssistantStream(
         page,
@@ -417,8 +565,37 @@ export async function askChatGPT(
         if (onDelta) await onDelta(delta);
       }, timeoutMs);
     }
+    const uiRoundTripMs = mark() - beforeUiRoundTrip;
 
+    // A settled session (one that already has a bound conversationUrl, from
+    // this turn or an earlier one) is refreshed here; the collision check
+    // already ran in bindNewConversationUrl for the first-message case above.
+    if (session) gptProxySessions.markTurn(session, page.url());
+    recordTurn({
+      requestId,
+      ...options.sessionKey === undefined ? {} : { sessionKey: options.sessionKey },
+      ...options.scenario === undefined ? {} : { scenario: options.scenario },
+      startedAt,
+      loginCheckMs,
+      navigationMs,
+      ...hydrationMs === undefined ? {} : { hydrationMs },
+      sendPromptMs,
+      uiRoundTripMs,
+      totalMs: Date.now() - startedAt,
+      success: true,
+    });
     return { text };
+  } catch (error) {
+    recordTurn({
+      requestId,
+      ...options.sessionKey === undefined ? {} : { sessionKey: options.sessionKey },
+      ...options.scenario === undefined ? {} : { scenario: options.scenario },
+      startedAt,
+      totalMs: Date.now() - startedAt,
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
   } finally {
     release();
   }

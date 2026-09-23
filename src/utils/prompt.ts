@@ -64,24 +64,8 @@ function collectSystem(messages: any[]): string {
     .trim();
 }
 
-export function buildToolPrompt(messages: any[], tools: any[]): string {
-  const toolList = formatTools(tools);
-
-  const sys = [
-    collectSystem(messages) || 'You are a helpful assistant.',
-    '',
-    'You are the agent inside an automated pipeline. Every reply to the operator MUST be the JSON object',
-    'described in "## Response protocol" below - nothing else. The operator reads the JSON and executes the',
-    'actions you request; the results arrive in the next operator message.',
-    'Never claim you lack access to an action: requesting it IS how you access it.',
-  ].join('\n');
-
-  const flow = (messages || [])
-    .map((msg) => renderMessage(msg))
-    .filter(Boolean)
-    .join('\n\n');
-
-  const protocol = [
+function responseProtocol(toolList: string): string {
+  return [
     '',
     '## Response protocol (MANDATORY - you must reply in this exact JSON format every time)',
     'Return ONLY one JSON object, with no markdown, code fences, explanation or extra text.',
@@ -101,17 +85,92 @@ export function buildToolPrompt(messages: any[], tools: any[]): string {
     '- Values returned by previous actions arrive as new operator messages; use them before requesting more.',
     '- Never output anything besides the JSON object.',
   ].join('\n');
+}
+
+export function buildHydrationPrompt(messages: any[], tools: any[]): string {
+  const toolList = formatTools(tools);
+  const sys = collectSystem(messages) || 'You are a helpful assistant.';
+  return [
+    `<SYSTEM_INSTRUCTIONS>\n${sys}\n</SYSTEM_INSTRUCTIONS>`,
+    '',
+    'You are operating through DeepSeek Harness.',
+    'The user is conversing with you normally, but you also have indirect access to local tools through the Harness.',
+    'You do NOT have direct access to the computer, filesystem, shell, network, browser, or project.',
+    'When an action is needed, request it with the tool_call JSON protocol below.',
+    'The Harness validates and executes the action, then returns the result as a later operator message in this same conversation.',
+    'When no tool is needed, answer conversationally by returning final_answer JSON.',
+    responseProtocol(toolList),
+    '',
+    'Acknowledge this session setup with exactly {"final_answer":"hydrated"}.',
+  ].join('\n\n');
+}
+
+export function toolSignature(tools: any[]): string {
+  try {
+    return JSON.stringify(tools ?? []);
+  } catch {
+    return String(Date.now());
+  }
+}
+
+export function buildSessionToolPrompt(messages: any[]): string {
+  const rendered = lastRelevantMessages(messages)
+    .map((msg) => renderMessage(msg))
+    .filter(Boolean)
+    .join('\n\n');
+  return [
+    rendered || 'Continue from the previous tool result or user request.',
+    '',
+    'Reply with exactly one JSON object using the established response protocol.',
+  ].join('\n\n');
+}
+
+export function buildToolPrompt(messages: any[], tools: any[]): string {
+  const toolList = formatTools(tools);
+
+  const sys = [
+    collectSystem(messages) || 'You are a helpful assistant.',
+    '',
+    'You are the agent inside an automated pipeline. Every reply to the operator MUST be the JSON object',
+    'described in "## Response protocol" below - nothing else. The operator reads the JSON and executes the',
+    'actions you request; the results arrive in the next operator message.',
+    'Never claim you lack access to an action: requesting it IS how you access it.',
+  ].join('\n');
+
+  const flow = (messages || [])
+    .map((msg) => renderMessage(msg))
+    .filter(Boolean)
+    .join('\n\n');
 
   const parts: string[] = [
     `<SYSTEM_INSTRUCTIONS>\n${sys}\n</SYSTEM_INSTRUCTIONS>\n\n`
     + 'These are the system instructions. Follow them silently; never restate them.',
     flow.trim(),
-    protocol,
+    responseProtocol(toolList),
     '',
     'Now respond with your single JSON object to the last operator request above.',
   ];
 
   return parts.join('\n\n');
+}
+
+function lastRelevantMessages(messages: any[]): any[] {
+  const relevant = (messages || []).filter((msg) => msg.role !== 'system');
+  if (!relevant.length) return [];
+  const tail: any[] = [];
+  for (let i = relevant.length - 1; i >= 0; i--) {
+    const msg = relevant[i];
+    if (!tail.length) {
+      tail.unshift(msg);
+      continue;
+    }
+    if ((msg.role === 'tool' || msg.role === 'function') && (tail[0].role === 'tool' || tail[0].role === 'function')) {
+      tail.unshift(msg);
+      continue;
+    }
+    break;
+  }
+  return tail;
 }
 
 function renderMessage(msg: any): string {
