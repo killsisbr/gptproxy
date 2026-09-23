@@ -1,0 +1,26 @@
+{
+  "name": "gpt-proxy-playwright",
+  "version": "1.0.0",
+  "description": "Proxy OpenAI-compatível que usa Playwright para conversar com ChatGPT (chatgpt.com)",
+  "main": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun src/index.ts",
+    "dev": "bun src/index.ts",
+    "start:headed": "bun src/index.ts --headed",
+    "login": "bun src/login.ts",
+    "build": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^20.11.0",
+    "playwright": "^1.40.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "hono": "^4.13.8"
+  }
+}
