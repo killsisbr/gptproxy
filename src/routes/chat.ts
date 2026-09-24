@@ -1,6 +1,6 @@
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
-import { askChatGPT, LOGIN_REQUIRED, Attachment, SessionConversationCollisionError } from '../services/chatgpt.ts';
+import { getLoginStatus, askChatGPT, LOGIN_REQUIRED, Attachment, SessionConversationCollisionError } from '../services/chatgpt.ts';
 import { buildHydrationPrompt, buildPrompt, buildSessionToolPrompt, buildToolPrompt, toolSignature } from '../utils/prompt.ts';
 import { extractToolCalls, parseResponse, ParsedToolCall } from '../utils/tools.ts';
 
@@ -203,6 +203,10 @@ async function streamText(
 }
 
 export async function chatCompletions(c: Context) {
+  const login = await getLoginStatus();
+  if (!login.loggedIn) {
+    return c.json({ error: { message: 'Login required. Open /login-ui and save the ChatGPT session.' } }, 401);
+  }
   try {
     const body: any = await c.req.json();
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
