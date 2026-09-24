@@ -154,28 +154,43 @@ async function ensureLoggedIn(): Promise<boolean> {
   return ok;
 }
 
+const LOGGED_IN_SELECTORS = [
+  '#prompt-textarea',
+  '[contenteditable="true"]',
+  'textarea[placeholder*="Ask" i]',
+  'textarea[placeholder*="Message" i]',
+  '[data-testid="composer-speech-button"]',
+  '[data-testid="composer-send-button"]',
+  '[data-testid="new-chat-button"]',
+  'a[href^="/c/"]',
+];
+
+async function hasLoggedInUi(timeout = 1500): Promise<boolean> {
+  if (!page) return false;
+  for (const selector of LOGGED_IN_SELECTORS) {
+    const ok = await page
+      .locator(selector)
+      .first()
+      .waitFor({ state: 'attached', timeout })
+      .then(() => true)
+      .catch(() => false);
+    if (ok) return true;
+  }
+  return false;
+}
+
 async function checkLoggedIn(): Promise<boolean> {
   if (!page) return false;
   await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-  try {
-    await page.locator('#prompt-textarea').first().waitFor({ state: 'attached', timeout: 15000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return hasLoggedInUi(5000);
 }
 
 export async function getLoginStatus(): Promise<{ loggedIn: boolean; url?: string }> {
   try {
     if (!page) return { loggedIn: false };
-    const hasComposer = await page
-      .locator('#prompt-textarea')
-      .first()
-      .waitFor({ state: 'attached', timeout: 1500 })
-      .then(() => true)
-      .catch(() => false);
-    if (hasComposer) loginVerified = true;
-    return { loggedIn: hasComposer, url: page.url() };
+    const loggedIn = await hasLoggedInUi(1500);
+    if (loggedIn) loginVerified = true;
+    return { loggedIn, url: page.url() };
   } catch {
     return { loggedIn: false };
   }
@@ -211,7 +226,7 @@ const REAL_CONVERSATION_URL = /\/c\/(?!WEB:)[^/?#]+/u;
 async function startNewChat() {
   if (!page) throw new Error('Playwright not initialized');
   await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.locator('#prompt-textarea').first().waitFor({ state: 'visible', timeout: 15000 });
+  await findVisible(page, ['#prompt-textarea', '[contenteditable="true"]'], 15000);
 }
 
 /**
@@ -243,10 +258,13 @@ async function waitForNewConversationUrl(p: Page, timeoutMs: number): Promise<st
 const COMPOSER_INTERACTION_TIMEOUT_MS = 30000;
 
 async function sendPrompt(p: Page, text: string) {
-  const composer = p.locator('#prompt-textarea').first();
-  await composer.waitFor({ state: 'visible', timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
+  const composer = await findVisible(p, ['#prompt-textarea', '[contenteditable="true"]'], COMPOSER_INTERACTION_TIMEOUT_MS);
+  if (!composer) throw new Error('ChatGPT composer not found');
   await composer.click({ timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
-  await composer.fill(text, { timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
+  await composer.fill(text, { timeout: COMPOSER_INTERACTION_TIMEOUT_MS }).catch(async () => {
+    await p.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+    await p.keyboard.type(text, { delay: 1 });
+  });
   await sleep(200);
 
   const btn = await findVisible(p, [
@@ -293,17 +311,26 @@ async function readAssistantStream(
   timeoutMs: number
 ): Promise<string> {
   const msg = p.locator('[data-message-author-role="assistant"]').last();
-  await msg.waitFor({ state: 'attached', timeout: 30000 });
+  const legacyMsg = await msg.waitFor({ state: 'attached', timeout: 5000 }).then(() => true).catch(() => false);
 
   const contentLoc = msg.locator('.markdown').first();
   const readText = async (): Promise<string> => {
     try {
-      const visible = await contentLoc.first().waitFor({ state: 'visible', timeout: 1000 }).catch(() => null);
-      if (!visible) {
-        const raw = await msg.innerText().catch(() => '');
-        return raw;
+      if (legacyMsg) {
+        const visible = await contentLoc.first().waitFor({ state: 'visible', timeout: 1000 }).catch(() => null);
+        if (!visible) {
+          const raw = await msg.innerText().catch(() => '');
+          return raw;
+        }
+        return await contentLoc.first().innerText().catch(() => '');
       }
-      return await contentLoc.first().innerText().catch(() => '');
+      return await p.evaluate(() => {
+        const texts = Array.from(document.querySelectorAll('main p, main .markdown, main article, main [dir="auto"]'))
+          .map((el) => (el as HTMLElement).innerText?.trim() || '')
+          .filter(Boolean)
+          .filter((text) => !text.startsWith('User:'));
+        return texts.at(-1) || '';
+      });
     } catch {
       return '';
     }
