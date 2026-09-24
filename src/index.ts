@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { bearerAuth } from 'hono/bearer-auth';
 import { chatCompletions } from './routes/chat.ts';
+import { loginUiToken, registerLoginUiRoutes } from './routes/login-ui.ts';
 import { initPlaywright, closePlaywright, getLoginStatus, generateImage, getContext, LOGIN_REQUIRED, BrowserType, listGptProxySessions, clearGptProxySession } from './services/chatgpt.ts';
 import { telemetryLogPath } from './services/telemetry.ts';
 import { networkInterfaces } from 'os';
@@ -10,6 +11,7 @@ import { fileURLToPath } from 'url';
 
 const app = new Hono();
 app.use('*', cors());
+registerLoginUiRoutes(app);
 
 function getNetworkAddress() {
   const interfaces = networkInterfaces();
@@ -206,6 +208,7 @@ if (isEntry) {
       console.log('\nChatGPT Proxy started!');
       console.log(`- Local:   http://localhost:${port}`);
       if (networkIP) console.log(`- Network: http://${networkIP}:${port}`);
+      console.log(`\nGPTProxy login UI: http://localhost:${port}/login-ui?token=${loginUiToken}`);
       console.log('\nAvailable Routes:');
       for (const route of app.routes) {
         console.log(`- [${route.method}] ${route.path}`);
