@@ -27,9 +27,13 @@ function reject() {
 }
 
 async function ensurePage() {
-  if (!getPage()) await initPlaywright(true, 'chromium');
-  const p = getPage();
-  if (!p) throw new Error('Playwright page is not available');
+  let p = getPage();
+  if (!p || p.isClosed()) {
+    await closePlaywright().catch(() => {});
+    await initPlaywright(true, 'chromium');
+    p = getPage();
+  }
+  if (!p || p.isClosed()) throw new Error('Playwright page is not available');
   return p;
 }
 
