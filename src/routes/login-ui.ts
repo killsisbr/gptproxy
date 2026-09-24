@@ -73,7 +73,7 @@ function loginUiHtml(): string {
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
 const headers = {'content-type':'application/json','x-login-token':token};
-function log(msg){document.getElementById('log').textContent = new Date().toLocaleTimeString()+': '+msg+'\n'+document.getElementById('log').textContent.slice(0,3000)}
+function log(msg){document.getElementById('log').textContent = new Date().toLocaleTimeString()+': '+msg+String.fromCharCode(10)+document.getElementById('log').textContent.slice(0,3000)}
 async function api(path, body){const r=await fetch(path,{method:'POST',headers,body:JSON.stringify(body||{})}); const t=await r.text(); let j; try{j=JSON.parse(t)}catch{j={text:t}} if(!r.ok) throw new Error(j.error||t); return j}
 async function status(){const r=await fetch('/debug/login/status?token='+encodeURIComponent(token)); const j=await r.json(); const el=document.getElementById('status'); el.textContent=(j.loggedIn?'logado':'não logado')+' · '+(j.url||'sem página'); el.className=j.loggedIn?'ok':'bad'}
 async function refresh(){document.getElementById('shot').src='/debug/login/screenshot?token='+encodeURIComponent(token)+'&t='+Date.now(); await status()}
