@@ -9,6 +9,12 @@ const PROTOCOL_REINFORCE =
   + 'If you refused because you thought an action was unavailable, correct that. Reply NOW with ONLY one JSON '
   + 'object: either {"tool_calls":[...]} or {"final_answer":"..."}. Nothing else.';
 
+
+function unwrapFinalAnswer(text: string): string {
+  const parsed = parseResponse(text);
+  return parsed.calls.length === 0 && parsed.answer ? parsed.answer : text;
+}
+
 const MIME_EXT: Record<string, string> = {
   'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/gif': 'gif',
   'image/webp': 'webp', 'image/svg+xml': 'svg', 'image/bmp': 'bmp',
@@ -244,6 +250,7 @@ export async function chatCompletions(c: Context) {
       prompt = buildPrompt(messages);
       if (!isStream) {
         const result = await askChatGPT(prompt, undefined, 300000, attachments, { ...askOpts });
+        const finalText = unwrapFinalAnswer(result.text ?? '');
         return c.json({
           id: completionId,
           object: 'chat.completion',
@@ -251,11 +258,11 @@ export async function chatCompletions(c: Context) {
           model,
           choices: [{
             index: 0,
-            message: { role: 'assistant', content: result.text },
+            message: { role: 'assistant', content: finalText },
             logprobs: null,
             finish_reason: 'stop',
           }],
-          usage: usage(prompt.length, result.text.length),
+          usage: usage(prompt.length, finalText.length),
         });
       }
 
@@ -264,36 +271,8 @@ export async function chatCompletions(c: Context) {
       c.header('Connection', 'keep-alive');
 
       return honoStream(c, async (sw: any) => {
-        const writeEvent = async (data: any) => {
-          await sw.write(`data: ${JSON.stringify(data)}\n\n`);
-        };
-
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [makeChoice({ role: 'assistant', content: '' })],
-        });
-
-        await askChatGPT(prompt, async (delta) => {
-          await writeEvent({
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model,
-            choices: [makeChoice({ content: delta })],
-          });
-        }, 300000, attachments, { ...askOpts });
-
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [makeChoice({}, 'stop')],
-        });
-        await sw.write('data: [DONE]\n\n');
+        const result = await askChatGPT(prompt, undefined, 300000, attachments, { ...askOpts });
+        await streamText(sw, c, unwrapFinalAnswer(result.text ?? ''), completionId, model);
       });
     }
 
