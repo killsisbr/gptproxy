@@ -226,7 +226,7 @@ const REAL_CONVERSATION_URL = /\/c\/(?!WEB:)[^/?#]+/u;
 async function startNewChat() {
   if (!page) throw new Error('Playwright not initialized');
   await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await findVisible(page, ['#prompt-textarea', '[contenteditable="true"]'], 15000);
+  await findVisible(page, ['#prompt-textarea', '[contenteditable="true"]'], 6000);
 }
 
 /**
@@ -255,30 +255,17 @@ async function waitForNewConversationUrl(p: Page, timeoutMs: number): Promise<st
  * payment prompt) surfaces as a bounded, catchable error instead of hanging
  * the request indefinitely.
  */
-const COMPOSER_INTERACTION_TIMEOUT_MS = 30000;
+const COMPOSER_INTERACTION_TIMEOUT_MS = 8000;
 
 async function sendPrompt(p: Page, text: string) {
   const composer = await findVisible(p, ['#prompt-textarea', '[contenteditable="true"]'], COMPOSER_INTERACTION_TIMEOUT_MS);
   if (!composer) throw new Error('ChatGPT composer not found');
   await composer.click({ timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
-  await composer.fill(text, { timeout: COMPOSER_INTERACTION_TIMEOUT_MS }).catch(async () => {
-    await p.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
-    await p.keyboard.type(text, { delay: 1 });
+  await p.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
+  await composer.fill(text, { timeout: 3000 }).catch(async () => {
+    await p.keyboard.type(text, { delay: 0 });
   });
-  await sleep(200);
-
-  const btn = await findVisible(p, [
-    '[data-testid="send-button"]',
-    '[data-testid="composer-send-button"]',
-    'button[type="submit"]',
-  ], 4000);
-  if (btn) {
-    await btn.click({ timeout: COMPOSER_INTERACTION_TIMEOUT_MS }).catch(async () => {
-      await composer.press('Enter', { timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
-    });
-  } else {
-    await composer.press('Enter', { timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
-  }
+  await composer.press('Enter', { timeout: COMPOSER_INTERACTION_TIMEOUT_MS });
 }
 
 export interface Attachment {
@@ -353,9 +340,10 @@ async function readAssistantStream(
 
     const stopBtn = await findVisible(p, ['[data-testid="stop-button"]'], 500);
     if (!stopBtn) {
-      // Generation finished streaming. Wait a generous quiet period for the
-      // full answer to render (covers "Analyzing image"/thinking pauses).
-      if (stalled >= 60) break;
+      // Generation finished. Keep a short quiet period so small DOM updates settle
+      // without adding minute-scale latency to short text responses.
+      if (stalled >= 6 && accumulated.trim()) break;
+      if (stalled >= 20) break;
     } else {
       stalled = 0;
     }
@@ -363,7 +351,7 @@ async function readAssistantStream(
     await sleep(150);
   }
 
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 4; i++) {
     const text = await readText();
     if (text.length > accumulated.length) {
       const delta = text.slice(accumulated.length);
